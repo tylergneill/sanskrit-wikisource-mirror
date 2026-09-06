@@ -30,6 +30,11 @@ function translitText(s) {
   }
 }
 
+// The artificial catch-all category process.py files unreachable pages under
+// (compare.py's ORPHAN_BUCKET_TITLE). Named here rather than described, so
+// reader-facing labels use the same term as the rest of the page.
+const ORPHAN_BUCKET_TITLE = "असम्बद्धवर्गीकृतम्";
+
 const style = document.createElement("style");
 style.textContent = `
   .changelog-summary { list-style: none; justify-content: flex-start; align-items: center; gap: 6px; }
@@ -45,6 +50,28 @@ style.textContent = `
     transition: transform 0.15s ease;
   }
   details[open] > .changelog-summary::after { transform: rotate(45deg); }
+
+  .changelog-bucket { margin-top: 8px; }
+  .changelog-bucket-summary {
+    cursor: pointer;
+    font-weight: 600;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .changelog-bucket-summary::-webkit-details-marker { display: none; }
+  .changelog-bucket-summary::after {
+    content: "";
+    display: inline-block;
+    width: 0.4em;
+    height: 0.4em;
+    border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted);
+    transform: rotate(-45deg);
+    transition: transform 0.15s ease;
+  }
+  details[open] > .changelog-bucket-summary::after { transform: rotate(45deg); }
 `;
 document.head.appendChild(style);
 
@@ -111,18 +138,23 @@ function fmtSizeDelta(oldBytes, newBytes) {
 // Combine N consecutive monthly changelog entries (oldest-first, chained --
 // each entry's old_date equals the previous entry's date) into one synthetic
 // entry spanning the whole group. Sizes/counts reduce trivially to the
-// group's first "old" and last "new". Item-level added/removed/changed lists
-// need real net-effect tracking across the group, not concatenation: e.g. an
-// item added in month 2 and removed in month 5 nets to neither an add nor a
-// remove over the full span, and an item added then later edited should
-// still show as "added" (with its final size/date), not also as "changed".
-// Replaying each month's added/removed/changed events in order against a
-// per-item running state is the only way to get this exactly right from the
-// monthly records alone (they don't carry a full item roster per month).
+// group's first "old" and last "new". Item-level lists need real net-effect
+// tracking across the group, not concatenation: e.g. an item added in month 2
+// and removed in month 5 nets to neither an add nor a remove over the full
+// span, and an item added then later edited should still show as "added"
+// (with its final size/date), not also as "changed".
+//
+// The same netting applies to placement changes, which is the whole point of
+// tracking them separately: a page categorized in month 2 and orphaned again
+// in month 5 nets to no placement change at all, and one categorized then
+// edited stays "categorized". Replaying each month's events in order against
+// a per-item running state is the only way to get this right from the monthly
+// records alone (they don't carry a full item roster per month).
 function reduceGroup(entries) {
   if (entries.length === 1) return entries[0];
 
-  const state = new Map(); // id -> {status: 'added'|'removed'|'present', bytes, date}
+  // status: 'added'|'removed'|'categorized'|'orphaned'|'recategorized'|'changed'
+  const state = new Map();
 
   for (const entry of entries) {
     for (const item of entry.items_added || []) {
@@ -136,12 +168,60 @@ function reduceGroup(entries) {
         state.set(item.id, { status: "removed", bytes: item.old_bytes });
       }
     }
-    for (const item of entry.items_with_changed_timestamp || []) {
+    // Placement moves. An item still net-new over the group stays "added" --
+    // being filed somewhere is part of arriving, not a separate event. Two
+    // opposite crossings cancel, restoring whatever the item was before.
+    for (const item of entry.items_categorized || []) {
       const prev = state.get(item.id);
       if (prev && prev.status === "added") {
-        // Still a net-new item over the whole group -- keep it "added" but
-        // roll its bytes/date forward to this later edit.
-        state.set(item.id, { status: "added", bytes: item.new_bytes, date: item.new });
+        state.set(item.id, { status: "added", bytes: item.new_bytes, date: item.date });
+      } else if (prev && prev.status === "orphaned") {
+        state.delete(item.id);
+      } else {
+        state.set(item.id, {
+          status: "categorized",
+          bytes: item.new_bytes,
+          date: item.date,
+          to: item.to,
+          from: prev && prev.status === "categorized" ? prev.from : item.from,
+        });
+      }
+    }
+    for (const item of entry.items_orphaned || []) {
+      const prev = state.get(item.id);
+      if (prev && prev.status === "added") {
+        state.set(item.id, { status: "added", bytes: item.old_bytes, date: prev.date });
+      } else if (prev && prev.status === "categorized") {
+        state.delete(item.id);
+      } else {
+        state.set(item.id, { status: "orphaned", bytes: item.old_bytes, from: item.from });
+      }
+    }
+    for (const item of entry.items_recategorized || []) {
+      const prev = state.get(item.id);
+      // A recategorization on top of an add or a crossing tells us nothing
+      // new -- the stronger event already describes the item's fate.
+      if (prev && (prev.status === "added" || prev.status === "categorized" || prev.status === "orphaned")) {
+        continue;
+      }
+      state.set(item.id, {
+        status: "recategorized",
+        bytes: item.new_bytes,
+        // Keep the group's earliest "from" so the span reads end-to-end.
+        from: prev && prev.status === "recategorized" ? prev.from : item.from,
+        to: item.to,
+      });
+    }
+    for (const item of entry.items_with_changed_timestamp || []) {
+      const prev = state.get(item.id);
+      if (prev && prev.status !== "changed") {
+        // Already classified as something stronger over this group (added, or
+        // a placement move) -- keep that, but roll bytes/date forward.
+        if (prev.status === "added") {
+          state.set(item.id, { status: "added", bytes: item.new_bytes, date: item.new });
+        } else {
+          state.set(item.id, { ...prev, bytes: item.new_bytes });
+        }
       } else {
         state.set(item.id, {
           status: "changed",
@@ -156,17 +236,30 @@ function reduceGroup(entries) {
 
   const items_added = [];
   const items_removed = [];
+  const items_categorized = [];
+  const items_orphaned = [];
+  const items_recategorized = [];
   const items_with_changed_timestamp = [];
   for (const [id, v] of state) {
     if (v.status === "added") items_added.push({ id, date: v.date, new_bytes: v.bytes });
     else if (v.status === "removed") items_removed.push({ id, old_bytes: v.bytes });
-    else if (v.status === "changed") {
+    else if (v.status === "categorized") {
+      items_categorized.push({ id, date: v.date, new_bytes: v.bytes, from: v.from, to: v.to });
+    } else if (v.status === "orphaned") {
+      items_orphaned.push({ id, old_bytes: v.bytes, from: v.from });
+    } else if (v.status === "recategorized") {
+      items_recategorized.push({ id, new_bytes: v.bytes, from: v.from, to: v.to });
+    } else if (v.status === "changed") {
       items_with_changed_timestamp.push({ id, old: v.old, new: v.new, old_bytes: v.old_bytes, new_bytes: v.new_bytes });
     }
   }
-  items_added.sort((a, b) => a.id.localeCompare(b.id));
-  items_removed.sort((a, b) => a.id.localeCompare(b.id));
-  items_with_changed_timestamp.sort((a, b) => a.id.localeCompare(b.id));
+  const byId = (a, b) => a.id.localeCompare(b.id);
+  items_added.sort(byId);
+  items_removed.sort(byId);
+  items_categorized.sort(byId);
+  items_orphaned.sort(byId);
+  items_recategorized.sort(byId);
+  items_with_changed_timestamp.sort(byId);
 
   const first = entries[0];
   const last = entries[entries.length - 1];
@@ -236,9 +329,15 @@ function reduceGroup(entries) {
     },
     items_added,
     items_removed,
+    items_categorized,
+    items_orphaned,
+    items_recategorized,
     items_with_changed_timestamp,
     items_added_count: items_added.length,
     items_removed_count: items_removed.length,
+    items_categorized_count: items_categorized.length,
+    items_orphaned_count: items_orphaned.length,
+    items_recategorized_count: items_recategorized.length,
     items_changed_count: items_with_changed_timestamp.length,
     items_added_pct: oldCount === 0 ? null : (100 * items_added.length) / oldCount,
     items_removed_pct: oldCount === 0 ? null : (100 * items_removed.length) / oldCount,
@@ -296,9 +395,12 @@ function renderEntry(entry) {
 
   const added = entry.items_added_count ?? 0;
   const removed = entry.items_removed_count ?? 0;
+  const categorized = entry.items_categorized_count ?? 0;
+  const orphanedCount = entry.items_orphaned_count ?? 0;
+  const recategorized = entry.items_recategorized_count ?? 0;
   const changed = entry.items_changed_count ?? 0;
 
-  if (added || removed || changed) {
+  if (added || removed || categorized || orphanedCount || recategorized || changed) {
     const details = document.createElement("details");
     const summary = document.createElement("summary");
     summary.style.cursor = "pointer";
@@ -306,23 +408,38 @@ function renderEntry(entry) {
     summary.style.fontSize = "0.9em";
     summary.className = "changelog-summary";
     summary.style.display = "flex";
-    summary.innerHTML = `<span>${added} pages added, ${removed} removed, ${changed} updated — <span style="color:var(--accent)">show detail</span></span>`;
+    // Placement changes are named separately from real additions/removals:
+    // a page merely crossing into or out of the orphan bucket used to read as
+    // an add or a remove, which made curation drives look like corpus events
+    // (2026-08 -> 09: 488 categorized pages showed as 504 "added").
+    const parts = [`${added} pages added`, `${removed} removed`];
+    if (categorized) parts.push(`${categorized} categorized`);
+    if (orphanedCount) parts.push(`${orphanedCount} uncategorized`);
+    if (recategorized) parts.push(`${recategorized} recategorized`);
+    parts.push(`${changed} updated`);
+    summary.innerHTML = `<span>${parts.join(", ")} — <span style="color:var(--accent)">show detail</span></span>`;
     details.appendChild(summary);
 
+    // Each bucket is its own nested dropdown rather than a heading over an
+    // always-open list: a single month can carry hundreds of entries in one
+    // bucket (2026-09 alone has 488 categorized), which buried the smaller
+    // buckets below it under a wall of scrolling.
     const buildList = (title, items, render) => {
       if (!items || items.length === 0) return;
-      const h = document.createElement("div");
-      h.style.marginTop = "8px";
-      h.style.fontWeight = "600";
-      h.textContent = `${title} (${items.length})`;
-      details.appendChild(h);
+      const sub = document.createElement("details");
+      sub.className = "changelog-bucket";
+      const subSummary = document.createElement("summary");
+      subSummary.className = "changelog-bucket-summary";
+      subSummary.textContent = `${title} (${items.length})`;
+      sub.appendChild(subSummary);
       const ul = document.createElement("ul");
       for (const item of items) {
         const li = document.createElement("li");
         li.textContent = render(item);
         ul.appendChild(li);
       }
-      details.appendChild(ul);
+      sub.appendChild(ul);
+      details.appendChild(sub);
     };
 
     const stripPrefix = (id) => translitText(id.replace(/^(page|index-item):/, ""));
@@ -334,6 +451,23 @@ function renderEntry(entry) {
       if (typeof item === "string") return stripPrefix(item);
       return `${stripPrefix(item.id)}${fmtSizeDelta(item.old_bytes, 0)}`;
     });
+    const stripCat = (id) => translitText(String(id).replace(/^cat:/, ""));
+    const fmtCats = (ids) => (ids && ids.length ? ids.map(stripCat).join(", ") : "—");
+
+    // Placement rows show the item's size plainly, never as a 0→n delta: the
+    // page existed before and after, so nothing grew from nothing. That framing
+    // is the same error the categorized/orphaned split exists to correct.
+    // The artificial catch-all category is named by its own title, matching how
+    // the rest of the page refers to it (the "include असम्बद्धवर्गीकृतम्" control
+    // just above these entries, and the Structure section that glosses it).
+    // translitText keeps it in whatever scheme the reader has selected.
+    const orphanCat = translitText(ORPHAN_BUCKET_TITLE);
+    buildList(`Categorized (moved out of ${orphanCat})`, entry.items_categorized, (item) =>
+      `${stripPrefix(item.id)} → ${fmtCats(item.to)} (${fmtBytesCompact(item.new_bytes ?? 0)})`);
+    buildList(`Moved into ${orphanCat}`, entry.items_orphaned, (item) =>
+      `${stripPrefix(item.id)} (was ${fmtCats(item.from)}) (${fmtBytesCompact(item.old_bytes ?? 0)})`);
+    buildList("Recategorized", entry.items_recategorized, (item) =>
+      `${stripPrefix(item.id)}: ${fmtCats(item.from)} → ${fmtCats(item.to)} (${fmtBytesCompact(item.new_bytes ?? 0)})`);
     buildList("Updated", entry.items_with_changed_timestamp, (c) =>
       `${stripPrefix(c.id)}: ${fmtDate(c.old)} → ${fmtDate(c.new)}${fmtSizeDelta(c.old_bytes, c.new_bytes)}`);
 
@@ -342,7 +476,7 @@ function renderEntry(entry) {
     const counts = document.createElement("p");
     counts.style.color = "var(--muted)";
     counts.style.fontSize = "0.9em";
-    counts.textContent = "no pages added, removed, or updated";
+    counts.textContent = "no pages added, removed, recategorized, or updated";
     div.appendChild(counts);
   }
 

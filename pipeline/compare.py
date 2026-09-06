@@ -25,45 +25,79 @@ STAT_KEYS = ("raw_bytes", "content_bytes", "transliterated_bytes")
 ORPHAN_BUCKET_TITLE = "असम्बद्धवर्गीकृतम्"
 
 
-def collect_items(root: dict, include_orphan_bucket: bool = False) -> Dict[str, dict]:
-    """Walk a tree.json root, return {item_id: stats} for every page/index-item,
-    deduped by first occurrence (a page/index-item's stats are identical at
-    every category it's genuinely filed under, so first-seen is as good as any).
+def collect_items_detailed(root: dict) -> Dict[str, dict]:
+    """Walk a tree.json root, return {item_id: record} for every page/index-item
+    anywhere in the tree -- the orphan bucket included.
 
-    root.stats deliberately excludes the orphan bucket (असम्बद्धवर्गीकृतम्, a
-    direct child of root -- see process.py's build_tree_json), so by default
-    this walk skips it too, to keep item-level counts consistent with the
-    size/count deltas read from root.stats. Pass include_orphan_bucket=True to
-    walk it anyway (e.g. for a separate, explicitly-labeled orphan-bucket diff)."""
+    Unlike the plain first-occurrence-wins roster, this keeps the two facts an
+    item's *placement* consists of, which is what distinguishes a real corpus
+    change from a filing change:
+
+      stats      first occurrence's stats (identical at every genuine filing)
+      categories set of category node ids the item is filed under
+      orphaned   True if EVERY filing is inside असम्बद्धवर्गीकृतम्
+
+    `orphaned` is deliberately all-filings-are-orphan rather than any: an item
+    filed both in a real category and in the bucket is centrally reachable, so
+    it is not orphaned. The bucket only ever holds items with no reachable
+    filing at all (see process.py's build_tree_json), so the two readings agree
+    in practice -- but the strict one keeps this correct if that ever changes."""
     items: Dict[str, dict] = {}
 
-    def walk_page(node: dict) -> None:
+    def record(node: dict, cat_id, orphan: bool) -> None:
+        rec = items.get(node["id"])
+        if rec is None:
+            rec = items[node["id"]] = {
+                "stats": node["stats"],
+                "categories": set(),
+                "orphaned": True,
+            }
+        if cat_id is not None:
+            rec["categories"].add(cat_id)
+        if not orphan:
+            rec["orphaned"] = False
+
+    def walk_page(node: dict, cat_id, orphan: bool) -> None:
         if node["type"] == "page-pointer":
             return
-        if node["id"] not in items:
-            items[node["id"]] = node["stats"]
+        record(node, cat_id, orphan)
         for sub in node.get("subpages", []):
-            walk_page(sub)
+            # A subpage is filed wherever its top-level parent is; it carries
+            # no category tag of its own in the tree.
+            walk_page(sub, cat_id, orphan)
 
-    def walk(node: dict) -> None:
-        ntype = node["type"]
-        if ntype == "category-pointer":
+    def walk(node: dict, orphan: bool) -> None:
+        if node["type"] == "category-pointer":
             return
-        if not include_orphan_bucket and node["title"] == ORPHAN_BUCKET_TITLE:
-            return
-        # category
+        orphan = orphan or node.get("title") == ORPHAN_BUCKET_TITLE
         for child in node.get("children", []):
-            walk(child)
+            walk(child, orphan)
         for page in node.get("pages", []):
-            walk_page(page)
+            walk_page(page, node["id"], orphan)
         for idx in node.get("index_items", []):
             if idx["type"] == "index-item-pointer":
                 continue
-            if idx["id"] not in items:
-                items[idx["id"]] = idx["stats"]
+            record(idx, node["id"], orphan)
 
-    walk(root)
+    walk(root, False)
     return items
+
+
+def collect_items(root: dict, include_orphan_bucket: bool = False) -> Dict[str, dict]:
+    """{item_id: stats} for every page/index-item, deduped by first occurrence.
+
+    root.stats deliberately excludes the orphan bucket (असम्बद्धवर्गीकृतम्, a
+    direct child of root -- see process.py's build_tree_json), so by default
+    this skips it too, keeping item-level counts consistent with the size/count
+    deltas read from root.stats. Pass include_orphan_bucket=True to walk it
+    anyway. Derived from collect_items_detailed so there is one walk to keep
+    correct, not two."""
+    detailed = collect_items_detailed(root)
+    return {
+        iid: rec["stats"]
+        for iid, rec in detailed.items()
+        if include_orphan_bucket or not rec["orphaned"]
+    }
 
 
 def pct(delta: float, base: float):
@@ -113,6 +147,81 @@ def added_removed(old_items: Dict[str, dict], new_items: Dict[str, dict]) -> Tup
         for iid in sorted(set(old_items) - set(new_items))
     ]
     return added, removed
+
+
+def classify_changes(old: Dict[str, dict], new: Dict[str, dict]) -> dict:
+    """Partition every item across two detailed rosters into what actually
+    happened to it. Takes collect_items_detailed output (orphan bucket
+    included), so an item is present in a roster whenever the wiki had it at
+    all -- reachability is a property recorded on the item, not a reason to
+    omit it.
+
+    The partition is total over set(old) | set(new): each id lands in exactly
+    one of added / removed / (present in both), and the crossings and
+    recategorizations subdivide that last group. Everything left over is a
+    plain modification, which diff_timestamps reports separately.
+
+      added         id absent from old, present in new -- a real new page
+      removed       id present in old, absent from new -- really deleted
+      categorized   orphaned in old, centrally reachable in new: someone
+                    filed it into the category tree. Curation, not growth.
+      orphaned      the reverse -- fell out of the reachable tree
+      recategorized centrally reachable in both, but under a different set
+                    of categories
+
+    Why this exists: `added`/`removed` alone conflate all five. Before this
+    split, 488 शिवपुराणम् pages being categorized in 2026-09 read as 504
+    "added" and, the month before, 486 falling out read as 487 "removed" --
+    a -487/+504 round trip in the trend charts where the wiki gained and lost
+    nothing. See notes on the About page's Deltas section.
+
+    NOT detected: page moves/renames. The item id is the page's full title
+    (process.py's `page:{title}`), so a rename is a different id and shows up
+    as one `added` plus one `removed`. The dump carries no move log, so there
+    is no signal to detect it with -- only a heuristic pairing on identical
+    bytes, which is not attempted here."""
+    old_ids, new_ids = set(old), set(new)
+
+    def size(rec: dict) -> int:
+        return rec["stats"].get("transliterated_bytes", 0) or 0
+
+    added = [
+        {"id": i, "date": new[i]["stats"].get("last_changed"), "new_bytes": size(new[i])}
+        for i in sorted(new_ids - old_ids)
+    ]
+    removed = [{"id": i, "old_bytes": size(old[i])} for i in sorted(old_ids - new_ids)]
+
+    categorized, orphaned, recategorized = [], [], []
+    for i in sorted(old_ids & new_ids):
+        was, now = old[i]["orphaned"], new[i]["orphaned"]
+        if was and not now:
+            categorized.append({
+                "id": i,
+                "date": new[i]["stats"].get("last_changed"),
+                "new_bytes": size(new[i]),
+                "to": sorted(new[i]["categories"]),
+            })
+        elif now and not was:
+            orphaned.append({
+                "id": i,
+                "old_bytes": size(old[i]),
+                "from": sorted(old[i]["categories"]),
+            })
+        elif not was and not now and old[i]["categories"] != new[i]["categories"]:
+            recategorized.append({
+                "id": i,
+                "from": sorted(old[i]["categories"]),
+                "to": sorted(new[i]["categories"]),
+                "new_bytes": size(new[i]),
+            })
+
+    return {
+        "added": added,
+        "removed": removed,
+        "categorized": categorized,
+        "orphaned": orphaned,
+        "recategorized": recategorized,
+    }
 
 
 def _stats_report(old_stats: dict, new_stats: dict) -> dict:
@@ -166,31 +275,52 @@ def build_report(old_path: Path, new_path: Path) -> dict:
     old_all_stats = old_data.get("all_stats") or old_stats
     new_all_stats = new_data.get("all_stats") or new_stats
 
-    old_items = collect_items(old_data["root"])
-    new_items = collect_items(new_data["root"])
+    # One orphan-inclusive roster per side. classify_changes then splits every
+    # item by what actually happened to it, so a page merely crossing the
+    # orphan-bucket boundary is reported as categorized/orphaned rather than
+    # as a spurious add/remove -- see its docstring.
+    old_items = collect_items_detailed(old_data["root"])
+    new_items = collect_items_detailed(new_data["root"])
 
-    changed_ts = diff_timestamps(old_items, new_items)
-    added, removed = added_removed(old_items, new_items)
+    changes = classify_changes(old_items, new_items)
 
-    old_all_items = collect_items(old_data["root"], include_orphan_bucket=True)
-    new_all_items = collect_items(new_data["root"], include_orphan_bucket=True)
-    added_all, removed_all = added_removed(old_all_items, new_all_items)
+    # Timestamp diffs stay central-only: an item's last_changed is the same
+    # wherever it sits, and the central roster is what the size/count deltas
+    # above are drawn from.
+    old_central = {i: r["stats"] for i, r in old_items.items() if not r["orphaned"]}
+    new_central = {i: r["stats"] for i, r in new_items.items() if not r["orphaned"]}
+    changed_ts = diff_timestamps(old_central, new_central)
 
     old_count = old_stats.get("count", 0) or 0
+
+    added = changes["added"]
+    removed = changes["removed"]
+    categorized = changes["categorized"]
+    orphaned = changes["orphaned"]
+    recategorized = changes["recategorized"]
 
     report = _stats_report(old_stats, new_stats)
     report["all"] = _stats_report(old_all_stats, new_all_stats)
     report.update({
         "items_added": added,
         "items_removed": removed,
+        "items_categorized": categorized,
+        "items_orphaned": orphaned,
+        "items_recategorized": recategorized,
         "items_with_changed_timestamp": changed_ts,
         "items_added_count": len(added),
         "items_removed_count": len(removed),
+        "items_categorized_count": len(categorized),
+        "items_orphaned_count": len(orphaned),
+        "items_recategorized_count": len(recategorized),
         "items_changed_count": len(changed_ts),
         "items_added_pct": pct(len(added), old_count),
         "items_removed_pct": pct(len(removed), old_count),
-        "items_added_count_all": len(added_all),
-        "items_removed_count_all": len(removed_all),
+        # Retained under their old names: these were already the
+        # orphan-inclusive add/remove counts, which is exactly what `added`
+        # and `removed` now mean.
+        "items_added_count_all": len(added),
+        "items_removed_count_all": len(removed),
     })
     return report
 
@@ -215,6 +345,9 @@ def print_summary(report: dict) -> None:
     print()
     print(f"items added: {report['items_added_count']} ({fmt_pct(report['items_added_pct'])} of old total)")
     print(f"items removed: {report['items_removed_count']} ({fmt_pct(report['items_removed_pct'])} of old total)")
+    print(f"items categorized (orphan bucket -> category tree): {report['items_categorized_count']}")
+    print(f"items orphaned (category tree -> orphan bucket): {report['items_orphaned_count']}")
+    print(f"items recategorized (within the category tree): {report['items_recategorized_count']}")
     print(f"items with changed last_changed timestamp: {report['items_changed_count']}")
     for entry in report["items_with_changed_timestamp"][:20]:
         print(f"  {entry['id']}: {entry['old']} -> {entry['new']}")
@@ -231,7 +364,7 @@ def print_summary(report: dict) -> None:
     print(f"count: {ao['count']:,} -> {an['count']:,}  ({ad['count']:+,}, {fmt_pct(ad['count_pct'])})")
     if ao['text_count'] is not None and an['text_count'] is not None:
         print(f"text_count: {ao['text_count']:,} -> {an['text_count']:,}  ({ad['text_count']:+,}, {fmt_pct(ad['text_count_pct'])})")
-    print(f"items added: {report['items_added_count_all']}, items removed: {report['items_removed_count_all']}")
+    print("(items added/removed above are already orphan-inclusive)")
 
 
 def main() -> None:
