@@ -86,7 +86,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pipeline.build_tree import (
@@ -142,6 +142,15 @@ class ContentIndex:
     index_categories: dict[str, set[str]]  # Index item bare title -> its own direct category tags
     index_timestamps: dict[str, str]  # Index item bare title -> its own revision timestamp
     index_page_rollup: dict[str, Stats]  # Index item bare title -> summed stats over its untranscluded पृष्ठम्:Title/N children
+    # Only --extract-text reads these three; nothing in tree assembly does.
+    # They carry the scan-leaf TEXT, which is otherwise discarded once counted,
+    # and the Index -> leaves mapping needed to tell which leaves a
+    # transclusion stub actually publishes.
+    page_sizes: dict[str, ContentSizeResult] = field(default_factory=dict)
+    page_records: list[PageRecord] = field(default_factory=list)
+    leaves_by_index: dict[str, list[str]] = field(default_factory=dict)
+    index_records: list[PageRecord] = field(default_factory=list)
+    untranscluded_leaves_by_index: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _owning_index_title(page_title: str, page_ns_name: str) -> str | None:
@@ -166,6 +175,10 @@ class LeafSizeIndex:
     untranscluded_index_rollup: dict[str, Stats]  # Index bare title -> summed stats over its leaves (untranscluded items only)
     leaves_by_index: dict[str, list[str]]  # Index bare title -> its leaf full-titles (पृष्ठम्:Title/N), transcluded indexes only
     leaf_sizes: dict[str, ContentSizeResult]  # leaf full-title -> its content size (transcluded-index leaves only)
+    all_leaf_sizes: dict[str, ContentSizeResult]  # every leaf, transcluded or not -- for --extract-text, which writes text the rollup only counts
+    all_leaf_records: list[PageRecord]  # the records behind all_leaf_sizes, in dump order
+    # Defaulted, so it must follow every non-default field above.
+    untranscluded_leaves_by_index: dict[str, list[str]] = field(default_factory=dict)  # the same leaves as titles, for --extract-text
 
 
 def compute_page_ns_sizes(
@@ -218,6 +231,9 @@ def compute_page_ns_sizes(
 
     untranscluded_index_rollup: dict[str, Stats] = {}
     leaves_by_index: dict[str, list[str]] = {}
+    # The same leaves, kept as titles: --extract-text folds them into the Index
+    # item's own file so a scan nobody has assembled is still openable.
+    untranscluded_leaves_by_index: dict[str, list[str]] = {}
     leaf_sizes: dict[str, ContentSizeResult] = {}
     for rec in owned_records:
         owner = _owning_index_title(rec.title, page_ns_name)
@@ -226,6 +242,7 @@ def compute_page_ns_sizes(
             leaves_by_index.setdefault(owner, []).append(rec.title)
             leaf_sizes[rec.title] = size
         else:
+            untranscluded_leaves_by_index.setdefault(owner, []).append(rec.title)
             current = untranscluded_index_rollup.get(owner) or _empty_stats()
             untranscluded_index_rollup[owner] = _merge_stats(current, _stats_dict(
                 size.raw_wikitext_bytes, size.content_bytes, size.transliterated_bytes,
@@ -233,9 +250,15 @@ def compute_page_ns_sizes(
                 rec.timestamp,
             ))
     return LeafSizeIndex(
+        untranscluded_leaves_by_index=untranscluded_leaves_by_index,
         untranscluded_index_rollup=untranscluded_index_rollup,
         leaves_by_index=leaves_by_index,
         leaf_sizes=leaf_sizes,
+        # Every leaf, not just the transcluded ones: `leaf_sizes` is deliberately
+        # partial (untranscluded leaves are summed into the rollup and their
+        # text dropped), but --extract-text wants the text of all of them.
+        all_leaf_sizes=sizes,
+        all_leaf_records=owned_records,
     )
 
 
@@ -298,6 +321,11 @@ def compute_all_content_sizes(
         index_categories=index_categories,
         index_timestamps=index_timestamps,
         index_page_rollup=leaf_size_index.untranscluded_index_rollup,
+        page_sizes=leaf_size_index.all_leaf_sizes,
+        page_records=leaf_size_index.all_leaf_records,
+        leaves_by_index=leaf_size_index.leaves_by_index,
+        index_records=index_records,
+        untranscluded_leaves_by_index=leaf_size_index.untranscluded_leaves_by_index,
     )
 
 
@@ -338,6 +366,42 @@ def _augment_main_sizes_with_transclusion(
             size.transliterated_bytes += leaf.transliterated_bytes
 
 
+def count_scanned_works(root: dict) -> int:
+    """How many distinct scanned works the collection has -- its `pdf_count`.
+
+    A scan reaches the tree two ways, and the same work can arrive by both:
+
+      - `source_indexes` on a Main page, one entry per Index the page
+        transcludes (a page can cite several, and several pages can cite one)
+      - an `index-item` node, an Index nobody transcludes, standing on its own
+
+    So this counts the UNION of Index titles, not links or nodes: 755 links
+    across 856 nodes resolve to 543 distinct works. Subpages cite scans too
+    and are walked for it, though 36 of their 48 are already cited higher up
+    -- which is the point of taking a union. One work, counted once, however
+    it is reached.
+
+    "PDF" is the wiki's own idiom here -- the destination is an Index: page,
+    and its underlying media is .djvu about a fifth of the time -- but an
+    Index page IS the scan from a reader's point of view, which is what the
+    figure is for.
+    """
+    titles: set[str] = set()
+
+    def walk(node: dict) -> None:
+        if node.get("type") == "index-item":
+            titles.add(node.get("title", ""))
+        for src in node.get("source_indexes") or []:
+            titles.add(src.get("title", ""))
+        for field in ("children", "pages", "index_items", "subpages"):
+            for child in node.get(field) or []:
+                walk(child)
+
+    walk(root)
+    titles.discard("")
+    return len(titles)
+
+
 def _stats_dict(raw: int, content: int, translit: int, count: int, last_changed: str, text_count: int = 0) -> dict:
     return {
         "raw_bytes": raw,
@@ -362,6 +426,52 @@ def _merge_stats(a: dict, b: dict) -> dict:
         max(a["last_changed"], b["last_changed"]) if a["last_changed"] or b["last_changed"] else "",
         a.get("text_count", 0) + b.get("text_count", 0),
     )
+
+
+# Pageids whose extracted text is on THIS machine, or None if unknowable.
+# Module-level rather than threaded through build_page_node/build_tree_json:
+# it is a fact about the local filesystem, not about the corpus, and the tree
+# builders take enough parameters already.
+#
+# None means "no extract directory" -- the flag is then omitted from every page
+# rather than published as False everywhere, because those are different
+# claims. A public checkout with no data/ is the former, and must not be read
+# as an authoritative "no text exists".
+_HAS_TEXT: set[int] | None = None
+
+
+def load_has_text(extract_dir: Path) -> set[int] | None:
+    """Pageids present in a `text_extract/` tree, read from its index.jsonl.
+
+    The index is the only reliable link: filenames embed a lossy, sanitized
+    title (`<pageid> - <Title>.txt`) that nothing downstream reconstructs.
+
+    **Index items count too.** An untranscluded scan is a browsable item whose
+    text is its leaves; the extractor folds those into a file for it, so it is
+    openable and belongs here. Keyed by pageid, so the namespace prefix on its
+    title (`अनुक्रमणिका:`) never has to be matched.
+
+    **Rollup parents count as having text.** A work that is a container plus
+    chapters holds no text of its own and gets no file, but it does get an
+    index entry carrying `parts` -- and asking for it returns the whole work.
+    So the test is presence in the index, not presence of a file: the question
+    this answers is "can a reader open this", and for those 191 works the
+    answer is yes.
+    """
+    index = extract_dir / "index.jsonl"
+    if not index.exists():
+        return None
+    present: set[int] = set()
+    for line in index.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("ns") in ("main", "index") and row.get("pageid") is not None:
+            present.add(row["pageid"])
+    return present
 
 
 def build_page_node(
@@ -416,6 +526,12 @@ def build_page_node(
     node = {
         "id": f"page:{main_node.title}",
         "type": "page",
+        # Set only when this build could see the extracted text on disk; see
+        # _HAS_TEXT. Lets a local --fulltext server offer a link without the
+        # frontend or Sagarasangama reading data/ themselves.
+        **({"has_text": True}
+           if _HAS_TEXT is not None and main_node.record.pageid in _HAS_TEXT
+           else {}),
         "title": main_node.title,
         "url": page_url(main_node.title),
         "stats": own_stats,
@@ -447,13 +563,27 @@ def build_page_node(
 def build_index_item_node(bare_title: str, content_index: ContentIndex, index_ns_name: str) -> dict:
     size = content_index.index_sizes.get(bare_title)
     rec_timestamp = content_index.index_timestamps.get(bare_title, "")
+    # Its pageid, so the has_text lookup needs no namespace-prefix matching.
+    pageid = next((r.pageid for r in content_index.index_records
+                   if r.title.split(":", 1)[-1] == bare_title), None)
+    has_text = _HAS_TEXT is not None and pageid in _HAS_TEXT
     own_stats = _stats_dict(
         size.raw_wikitext_bytes if size else 0,
         size.content_bytes if size else 0,
         size.transliterated_bytes if size else 0,
         1,
         rec_timestamp,
-        text_count=1,
+        # **A scan whose pages were never populated is not a text.** 76 Index
+        # items here have no content anywhere -- nothing transcluded, no
+        # proofread leaves, only an uploaded file -- so counting them made
+        # `text_count` a count of things-we-list rather than of texts. They
+        # stay listed and browsable; they simply stop claiming to be texts.
+        #
+        # Same judgment e-bhāratīsampat makes about its scan-only works, which
+        # it excludes from text_count and hides behind "also show PDF-only".
+        #
+        # This moved the published figure 3805 -> 3729 on 2026-08-29.
+        text_count=1 if has_text else 0,
     )
     # The Index page's own wikitext is just proofreading-status scaffolding
     # (near-zero content by design) -- the real scanned/proofread text lives
@@ -467,6 +597,8 @@ def build_index_item_node(bare_title: str, content_index: ContentIndex, index_ns
         "type": "index-item",
         "title": bare_title,
         "url": index_url(bare_title, index_ns_name),
+        # An untranscluded scan whose leaves were folded into a file for it.
+        **({"has_text": True} if has_text else {}),
         "stats": stats,
     }
 
@@ -922,6 +1054,9 @@ def build_tree_json(
             "stats": granth["stats"],
         }
 
+    all_stats = dict(all_stats)
+    all_stats["pdf_count"] = count_scanned_works(root)
+
     return {"root": root, "all_stats": all_stats}
 
 
@@ -934,13 +1069,20 @@ def main() -> None:
                          help="skip skrutable transliteration (faster, for quick iteration)")
     parser.add_argument("--workers", type=int, default=None,
                          help="worker processes for content-size computation (default: os.cpu_count())")
+    parser.add_argument("--extract-text", type=Path, nargs="?",
+                         const=Path("data/text_extract"), default=None,
+                         help="also write the corpus text to this directory "
+                              "(default data/text_extract): deva/ and iast/, "
+                              "split into main/ and page/. Costs only the file "
+                              "writes -- the text is already computed for the "
+                              "size metric and otherwise discarded.")
     args = parser.parse_args()
 
     run_start = time.time()
 
     xml_path = args.xml_path
     if xml_path is None:
-        candidates = sorted(Path("dump/1_current_format_live").glob("sawikisource-*.xml"))
+        candidates = sorted(Path("data/dump/1_current_format_live").glob("sawikisource-*.xml"))
         if not candidates:
             print("no dump/1_current_format_live/*.xml found", file=sys.stderr)
             sys.exit(1)
@@ -987,6 +1129,74 @@ def main() -> None:
         transclusion_map=transclusion_map, workers=args.workers,
     )
 
+    if args.extract_text:
+        # Before tree assembly, because this is the one consumer of the TEXT
+        # rather than the byte counts, and the text is in hand right now --
+        # nothing below reads it, and `content_cache` blanks it outright.
+        # Lives in the private `rivulet` package; exits 2 if it is absent.
+        # See pipeline/fulltext.py -- nothing above this line needs it, so a
+        # checkout without rivulet still builds the tree and the sizes.
+        from pipeline.fulltext import load_writer
+        write_text_extract = load_writer()
+        print(f"writing text extract to {args.extract_text}...", file=sys.stderr)
+        # title -> the scan leaves it transcludes, resolved exactly as
+        # _augment_main_sizes_with_transclusion resolves them for the byte
+        # rollup. A page whose text is 205 transcluded leaves must be openable,
+        # not just countable -- the Atlas already points at it.
+        transcluded_leaves = {}
+        if content_index.leaves_by_index:
+            for rec in dump_index.pages_by_ns[0]:
+                ranges = transclusion_ranges(rec.text)
+                if not ranges:
+                    continue
+                leaves = resolve_transcluded_leaves(
+                    ranges, content_index.leaves_by_index)
+                if leaves:
+                    # Reading order: leaf N sorts numerically, not as a string.
+                    transcluded_leaves[rec.title] = sorted(
+                        leaves,
+                        key=lambda t: (t.rsplit("/", 1)[0],
+                                       int(m.group()) if (m := __import__("re").search(
+                                           r"\d+$", t)) else 0))
+
+        summary = write_text_extract(
+            args.extract_text,
+            dump_index.pages_by_ns[0], content_index.main_sizes,
+            content_index.page_records, content_index.page_sizes,
+            # The redirect-resolved subpage tree, so a work's parts are found
+            # the way this Atlas already finds them. Title prefixes disagree:
+            # वाल्मीकिरामायणम्'s kandas are titled रामायणम्/... and a prefix
+            # match finds none of them.
+            main_nodes=main_nodes,
+            transcluded_leaves=transcluded_leaves,
+            # Scans nobody has assembled into a Main page: the Atlas lists them
+            # as items, so they get a fulltext too.
+            index_items=content_index.index_records,
+            index_leaves={r.title: content_index.untranscluded_leaves_by_index.get(
+                              r.title.split(":", 1)[-1], [])
+                          for r in content_index.index_records},
+        )
+        for label, s in summary["per_ns"].items():
+            print(f"  {label:5} {s['pages']:7} pages  "
+                  f"{s['content_bytes'] / 1e6:8.1f} MB deva  "
+                  f"{s['translit_bytes'] / 1e6:7.1f} MB iast", file=sys.stderr)
+        print(f"  written {summary['written']}, empty {summary['empty']} "
+              f"(redirects, stubs, markup-only)", file=sys.stderr)
+        if summary["collisions"]:
+            # Every write succeeds on a collision, so nothing else would say a
+            # page went missing. Loud by design.
+            print(f"  *** {len(summary['collisions'])} PATH COLLISIONS -- "
+                  f"pages lost to overwriting ***", file=sys.stderr)
+
+    # Which pages have extracted text on THIS machine. Read even when
+    # --extract-text was not passed: the extract may have been written by an
+    # earlier run, and the flag describes the disk, not this invocation.
+    global _HAS_TEXT
+    _HAS_TEXT = load_has_text(args.extract_text or Path("data/text_extract"))
+    if _HAS_TEXT is not None:
+        print(f"  {len(_HAS_TEXT)} main-namespace pages have extracted text on disk",
+              file=sys.stderr)
+
     print("assembling tree...", file=sys.stderr)
     tree = build_tree_json(dump_index, graph, main_nodes, transclusion_map, content_index, reverse_transclusion_map)
 
@@ -1012,7 +1222,7 @@ def main() -> None:
         from pipeline.content_cache import build_content_cache, write_content_cache
 
         content_cache = build_content_cache(dump_index, content_index, dump_index.pages_by_ns[0], dump_index.pages_by_ns[14])
-        content_cache_dir = Path("dump") / "_backfill_content_cache"
+        content_cache_dir = Path("data/dump") / "_backfill_content_cache"
         content_cache_dir.mkdir(parents=True, exist_ok=True)
         content_cache_path = content_cache_dir / f"content-{dump_date}.json.gz"
         write_content_cache(content_cache_path, content_cache)

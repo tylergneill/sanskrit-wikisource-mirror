@@ -433,9 +433,11 @@ def main() -> None:
 
     xml_path = args.xml_path
     if xml_path is None:
-        candidates = sorted(p for p in Path("dump").glob("sawikisource-*.xml"))
+        # rglob: the exports live in data/dump/1_current_format_live/, so a
+        # flat glob here matched nothing and this fallback never fired.
+        candidates = sorted(p for p in Path("data/dump").rglob("sawikisource-*.xml"))
         if not candidates:
-            print("no dump/*.xml found", file=sys.stderr)
+            print("no data/dump/**/*.xml found", file=sys.stderr)
             sys.exit(1)
         xml_path = candidates[0]
 

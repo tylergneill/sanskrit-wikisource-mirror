@@ -1,7 +1,7 @@
-.PHONY: refresh-dump refresh-dump-force process serve ngrok backfill regen-changelog audit audit-update-about verify
+.PHONY: serve-fulltext refresh-dump refresh-dump-force process extract-text serve ngrok backfill regen-changelog audit audit-update-about verify
 
 # Resolve the latest complete monthly dump export on dumps.wikimedia.org and
-# compare it against dump/: download/verify/decompress whatever's missing or
+# compare it against data/dump/: download/verify/decompress whatever's missing or
 # stale, remove leftover files from a prior export, and no-op if everything
 # already matches.
 refresh-dump:
@@ -16,6 +16,17 @@ refresh-dump-force:
 # with e.g. `make process WORKERS=4` (default: os.cpu_count()).
 process:
 	python -m pipeline.process --out docs/data/tree.json $(if $(WORKERS),--workers $(WORKERS))
+
+# Same as `process`, but ALSO writes the corpus text to
+# data/text_extract/{deva,iast}/{main,page}/ -- the text `process` already
+# computes for its size metric and then throws away. Adds only the file writes
+# to the run. Gitignored; this repo hosts no text.
+#
+# NEEDS the private `rivulet` package, which owns the writer. Without it this
+# EXITS 2 ("fulltext machinery not installed"), distinct from 1 = failure --
+# and `make process` itself is entirely unaffected either way.
+extract-text:
+	python -m pipeline.process --out docs/data/tree.json --extract-text $(if $(WORKERS),--workers $(WORKERS))
 
 # Report likely breadcrumb/category structural problems on the live wiki for
 # manual review -- never mutates the dump or docs/data/tree.json. See
@@ -49,19 +60,25 @@ backfill:
 # entries are diffed/compared.
 regen-changelog:
 	rm -f docs/data/changelog.json
-	python -m pipeline.backfill --months $(shell ls dump/_backfill_snapshots | sed -E 's/^tree-(.+)\.json(\.gz)?$$/\1/' | sort -u)
+	python -m pipeline.backfill --months $(shell ls data/dump/_backfill_snapshots | sed -E 's/^tree-(.+)\.json(\.gz)?$$/\1/' | sort -u)
 
-# Serve the frontend (docs/) locally, on port 8000. Unlike plain
+# Serve the frontend (docs/) locally, on port 8001. Unlike plain
 # `python -m http.server`, gzip-compresses JSON/JS/HTML/CSS responses and
 # sets Cache-Control -- matters most when tunneling over ngrok on a mobile
 # data plan, where re-transferring uncompressed tree.json/changelog.json on
 # every reload burns through a data cap fast.
+# Same server, plus the extracted text at /text/<pageid>, so each page gets a
+# `txt` badge. LOCALHOST ONLY -- binds 127.0.0.1, and the text lives outside
+# docs/ so no deploy can pick it up. Needs `make extract-text` to have run.
+serve-fulltext:
+	cd docs && python ../serve_docs.py --fulltext $(ARGS)
+
 serve:
 	cd docs && python ../serve_docs.py
 
-# Expose the local server (port 8000) via a public ngrok tunnel.
+# Expose the local server (port 8001) via a public ngrok tunnel.
 ngrok:
-	ngrok http 8000
+	ngrok http 8001
 
 free-server-port:
-	kill $$(lsof -ti tcp:8000)
+	kill $$(lsof -ti tcp:8001)

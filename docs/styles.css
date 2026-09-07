@@ -1114,3 +1114,17 @@ a[target="_blank"]::after{
   max-width: min(360px, calc(100vw - 48px));
 }
 .sourceTimelineTooltip .ttLabel{ color: var(--muted); }
+
+/* The local-only plain-text link, shown by `serve_docs.py --fulltext`.
+   Deliberately quiet: it is a dev affordance, not part of the published UI,
+   and never renders on the deployed site. */
+.localTxtLink {
+  margin-left: 6px;
+  font-size: 0.8em;
+  opacity: 0.65;
+  text-decoration: none;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.localTxtLink:hover { opacity: 1; }

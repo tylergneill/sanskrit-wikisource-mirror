@@ -306,10 +306,13 @@ def main() -> None:
 
     xml_path = args.xml_path
     if xml_path is None:
-        candidates = sorted(Path("dump").glob(DEFAULT_DUMP_GLOB))
+        # rglob, not glob: the exports live one level down, in the era folder
+        # `1_current_format_live/`. A flat glob on data/dump/ matched nothing
+        # and this fallback never fired.
+        candidates = sorted(Path("data/dump").rglob(DEFAULT_DUMP_GLOB))
         candidates = [p for p in candidates if p.suffix == ".xml"]
         if not candidates:
-            print("no dump/*.xml found; run `make refresh-dump`, "
+            print("no data/dump/**/*.xml found; run `make refresh-dump`, "
                   "or pass a path explicitly", file=sys.stderr)
             sys.exit(1)
         xml_path = candidates[0]

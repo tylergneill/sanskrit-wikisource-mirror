@@ -225,13 +225,13 @@ MATERIALIZE_SOURCE_URL = (
 #   2_legacy_format_live    -- pipeline.fetch_legacy, live rolling window
 #   3_materialized          -- every month < LEGACY_CUTOVER
 #   4_legacy_format_archive -- pipeline.fetch_legacy, Internet Archive
-DEFAULT_DUMP_ROOT = Path(__file__).resolve().parent.parent / "dump" / "1_current_format_live"
-DEFAULT_LEGACY_LIVE_DUMP_ROOT = Path(__file__).resolve().parent.parent / "dump" / "2_legacy_format_live"
-DEFAULT_MATERIALIZED_ROOT = Path(__file__).resolve().parent.parent / "dump" / "3_materialized"
-DEFAULT_LEGACY_ARCHIVE_DUMP_ROOT = Path(__file__).resolve().parent.parent / "dump" / "4_legacy_format_archive"
-DEFAULT_MATERIALIZE_SRC_DIR = Path(__file__).resolve().parent.parent / "dump" / "_materialize_src"
-DEFAULT_SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "dump" / "_backfill_snapshots"
-DEFAULT_CONTENT_CACHE_DIR = Path(__file__).resolve().parent.parent / "dump" / "_backfill_content_cache"
+DEFAULT_DUMP_ROOT = Path(__file__).resolve().parent.parent / "data" / "dump" / "1_current_format_live"
+DEFAULT_LEGACY_LIVE_DUMP_ROOT = Path(__file__).resolve().parent.parent / "data" / "dump" / "2_legacy_format_live"
+DEFAULT_MATERIALIZED_ROOT = Path(__file__).resolve().parent.parent / "data" / "dump" / "3_materialized"
+DEFAULT_LEGACY_ARCHIVE_DUMP_ROOT = Path(__file__).resolve().parent.parent / "data" / "dump" / "4_legacy_format_archive"
+DEFAULT_MATERIALIZE_SRC_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "_materialize_src"
+DEFAULT_SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "_backfill_snapshots"
+DEFAULT_CONTENT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "_backfill_content_cache"
 DEFAULT_CHANGELOG = Path(__file__).resolve().parent.parent / "docs" / "data" / "changelog.json"
 
 # The current live docs/data/tree.json already IS this month's processed

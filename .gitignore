@@ -70,9 +70,14 @@ node_modules/
 package.json
 package-lock.json
 
-# pipeline/fetch.py downloaded MediaWiki dump exports (regenerable, large)
-dump/
-
 # leftover disk-backed API response cache from the retired v1 scraper
 # (scrape.py, deleted) -- dead weight, safe to remove from disk entirely
 .api_cache/
+
+# Everything the pipeline downloads or derives, in one place:
+#   data/dump/          MediaWiki dump exports + backfill caches (9 GB)
+#   data/text_extract/  the corpus text itself, hundreds of MB
+# Both are regenerable, both are large, and this repo hosts no text. One
+# ignored tree rather than two, so nothing new under data/ can be missed.
+# Leading slash so docs/data/ stays tracked.
+/data/

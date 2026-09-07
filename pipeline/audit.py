@@ -802,6 +802,23 @@ def _findings_list(items: list[str]) -> str:
     return f'          <ul style="margin-left: 1.6em;">\n{lis}\n          </ul>'
 
 
+def _summary_text(description: str, label: str) -> str:
+    """The summary's own content, wrapped in a single span.
+
+    `.audit-summary` is `display: flex` (so the disclosure triangle can be a
+    flex-aligned ::before), which makes every child a flex item -- and flex
+    DISCARDS the whitespace between items. Every description here that ends in
+    an element rather than a text node -- any `_link()`, i.e. most of them --
+    therefore rendered as "tantralokah(27 candidate pages)", with the space
+    silently eaten. Wrapping the whole label makes it one flex item, and the
+    space inside it survives.
+
+    Found via the e-bharatisampat sibling, which hit the same thing the moment
+    a summary started with a <span>-wrapped Devanagari term.
+    """
+    return f"<span>{description} ({label})</span>"
+
+
 def _bullet(description: str, count: int, inner_html: str, unit: str | None = None) -> str:
     """`unit` spells out what the number actually counts, for checks where a
     bare count would be ambiguous or misleading -- e.g. the separator-family
@@ -810,11 +827,12 @@ def _bullet(description: str, count: int, inner_html: str, unit: str | None = No
     naming its noun ("pages", "categories", ...) unless the description itself
     already makes the unit unambiguous. Falls back to the bare count."""
     if count == 0:
-        return f'          <li class="audit-item"><div class="audit-summary audit-summary-empty">{description}: none found</div></li>'
+        # Same one-flex-item wrapper as _summary_text, for the same reason.
+        return f'          <li class="audit-item"><div class="audit-summary audit-summary-empty"><span>{description}: none found</span></div></li>'
     label = unit if unit is not None else str(count)
     return (
         f'          <li class="audit-item"><details>\n'
-        f'            <summary class="audit-summary">{description} ({label})</summary>\n'
+        f'            <summary class="audit-summary">{_summary_text(description, label)}</summary>\n'
         f"{inner_html}\n"
         f"          </details></li>"
     )
@@ -830,7 +848,7 @@ def _sub_bullet(description: str, count: int, inner_html: str, unit: str | None 
     label = unit if unit is not None else str(count)
     return (
         f'<li class="audit-item"><details>\n'
-        f'<summary class="audit-summary">{description} ({label})</summary>\n'
+        f'<summary class="audit-summary">{_summary_text(description, label)}</summary>\n'
         f"{inner_html}\n"
         f"</details></li>"
     )
@@ -913,7 +931,7 @@ def render_audit_html(
         _effective_prefix, sub = _group_by_next_token(title, others)
         breadcrumb_items.append(
             f'<li class="audit-item"><details>\n'
-            f'<summary class="audit-summary">{_link(title)} ({len(others)} candidate pages)</summary>\n'
+            f'<summary class="audit-summary">{_summary_text(_link(title), f"{len(others)} candidate pages")}</summary>\n'
             f"{sub}\n"
             f"</details></li>"
         )
@@ -923,7 +941,7 @@ def render_audit_html(
         _effective_prefix, sub = _group_by_next_token(title, members)
         separator_items.append(
             f'<li class="audit-item"><details>\n'
-            f'<summary class="audit-summary">{_link(title)} ({len(members)} pages)</summary>\n'
+            f'<summary class="audit-summary">{_summary_text(_link(title), f"{len(members)} pages")}</summary>\n'
             f"{sub}\n"
             f"</details></li>"
         )
@@ -1110,7 +1128,7 @@ def main() -> None:
 
     xml_path = args.xml_path
     if xml_path is None:
-        candidates = sorted(Path("dump/1_current_format_live").glob("sawikisource-*.xml"))
+        candidates = sorted(Path("data/dump/1_current_format_live").glob("sawikisource-*.xml"))
         if not candidates:
             print("no dump/1_current_format_live/*.xml found", file=sys.stderr)
             sys.exit(1)

@@ -22,18 +22,36 @@ Three parts connected by generated JSON files:
 
 3. **Historical backfill / changelog** (`pipeline/backfill.py` and friends) — walks backward through every available historical monthly dump, builds a throwaway `tree.json`-shaped snapshot for each month, and appends a pairwise size/count/item-level diff between consecutive months to `docs/data/changelog.json`. See "Historical backfill and the changelog" below for the full design.
 
+### Everything the pipeline writes lives under `data/`
+
+**One gitignored tree, not two** (consolidated 2026-08-28 — `dump/` used to sit
+at the repo root):
+
+    data/dump/           MediaWiki exports + backfill caches (~9 GB)
+    data/text_extract/   the corpus text, when `make extract-text` has run
+
+`.gitignore` carries a single `/data/` rule, so anything new the pipeline
+writes is ignored by default rather than needing its own line — and the leading
+slash keeps `docs/data/` tracked, which is the part that actually ships.
+
+The layout matches the other two Atlases, where `data/fulltext_cache/` holds
+what a site served and `data/text_extract/` holds clean text derived from it.
+This repo has no `fulltext_cache/`: its equivalent is the bulk XML in
+`data/dump/`, which is a dump export rather than a per-text walk.
+
 Because the frontend has no build step, `docs/` (including `docs/data/tree.json` and `docs/data/changelog.json`) is what's actually deployed — regenerating these and committing them *is* the deploy step for content updates.
 
 ## Commands
 
 ```
-make refresh-dump         # download/verify/decompress the current monthly dump into dump/
+make refresh-dump         # download/verify/decompress the current monthly dump into data/dump/
 make refresh-dump-force   # same, but force re-download/re-verify/re-decompress
 make process               # build docs/data/tree.json from the downloaded dump
 make backfill               # walk the full historical range, rebuild docs/data/changelog.json from scratch
 make regen-changelog         # rebuild docs/data/changelog.json from already-cached snapshots only, no network access
 make verify                # check the committed docs/ artifacts agree with each other (offline, seconds)
-make serve                 # serve docs/ locally on port 8000
+make extract-text          # process + write the corpus text out (NEEDS rivulet; exits 2 without it)
+make serve                 # serve docs/ locally on port 8001
 make ngrok                 # expose the local server via a public ngrok tunnel (for mobile testing)
 ```
 
@@ -55,11 +73,35 @@ make audit-update-about  # re-run the structural audit against the new dump, ref
 Two things about this sequence are easy to get wrong:
 
 - **`make process` is what demotes the previous month**, not `make backfill`. Restamping `__content_version__` is the whole mechanism: the prior month stops matching `ensure_snapshot`'s route 2 and becomes an ordinary history month resolved by route 1. `make process` also writes `content-<date>.json.gz`, which pre-positions the new month for cheap reassembly later.
-- **`make regen-changelog` cannot substitute for `make backfill` here.** `make process` writes `docs/data/tree.json` and the content cache, but never `dump/_backfill_snapshots/tree-<date>.json.gz` — snapshots are backfill's own storage layer. Since `regen-changelog` derives its month list by globbing that directory, a brand-new month is absent from the list entirely and its transition is silently never diffed. Only a real `pipeline.backfill` run creates the snapshot, via route 2's copy of the live `tree.json`. Use `regen-changelog` only when every month involved *already* has a snapshot.
+- **`make regen-changelog` cannot substitute for `make backfill` here.** `make process` writes `docs/data/tree.json` and the content cache, but never `data/dump/_backfill_snapshots/tree-<date>.json.gz` — snapshots are backfill's own storage layer. Since `regen-changelog` derives its month list by globbing that directory, a brand-new month is absent from the list entirely and its transition is silently never diffed. Only a real `pipeline.backfill` run creates the snapshot, via route 2's copy of the live `tree.json`. Use `regen-changelog` only when every month involved *already* has a snapshot.
 
 There is no test suite, linter, or build step in this repo — the one automated check is `make verify` (see "Deploy" below), which validates generated artifacts rather than code. `app.js`/`about.js` fetch their JSON data via relative paths, so `docs/` must be served over HTTP (`make serve`), not opened via `file://`.
 
 The `make` targets above are run by hand today. A GitHub Action driving fetch → process on the dump's own monthly cadence is the intended eventual automation, not yet implemented; publishing itself is already automated (below).
+
+## Text extraction lives in rivulet, and this repo does not require it
+
+`make process` computes the markup-free Devanāgarī and its IAST for every page,
+uses the byte counts, and drops the strings. `--extract-text` is the flag that
+writes them out — and **that writer moved to the private `rivulet` package**,
+because producing a redistributable corpus is a publishing act, while counting
+its bytes is not.
+
+Everything else stays here: the dump download, the tree build, the sizes. **The
+repo runs to completion without rivulet**; only `make extract-text` needs it,
+and it exits **2** rather than crashing when it is absent (see
+`pipeline/fulltext.py` — the one place this repo names rivulet).
+
+**It stays a flag on `process`, never a stage of its own.** The expansion is
+expensive and `process` already parallelizes it across a process pool; a
+standalone extractor has to redo the parse, the template index, the pool, the
+transclusion map and the augmentation. The first attempt did exactly that and
+took **17.7 minutes against `process`'s 3–5** for the same computation. Writing
+files is the only new work — everything else is already in hand by the time the
+writer is called.
+
+Dependency direction is one-way: **rivulet may import from this Atlas; this
+Atlas may never require rivulet.**
 
 ## Deploy (`.github/workflows/deploy.yml`)
 
@@ -174,7 +216,7 @@ Building this history uses **two** source kinds, both handled by `pipeline/backf
 
    `pipeline/materialize_snapshots.py` reconstructs each month on demand from `sawikisource-latest-pages-meta-history.xml.bz2` (every surviving revision ever made): for a cutoff date D, a page's state is the newest revision with timestamp ≤ D. Each month's reconstruction is generated on demand, one at a time, right when `ensure_month` needs it, and its raw XML is deleted again immediately after its snapshot is written — never more than one materialized dump on disk at a time. The underlying meta-history dump itself (~533MB) is downloaded once and cached, since re-downloading it is the expensive part. See `pipeline/materialize_snapshots.py`'s docstring for known deviations from a genuine dump of that month, and `pipeline/validate_materialization.py` (kept in the repo for future re-validation, not run automatically) for accuracy validation against real dumps at the era boundaries — confirmed within ~0.5-0.6% on every metric for the 2022-2025 gap; re-run against other era boundaries (2014-07, 2018-03/2018-08, 2019-03/2020-07) before trusting those ranges equally.
 
-   **Dump vintage.** Every materialized month inherits the vintage of whichever meta-history run happens to be cached, and nothing in the code or its outputs records which one that is: `MATERIALIZE_SOURCE_URL` fetches the undated `latest/` alias, the file is saved under that same undated name, and `_ensure_materialize_source` is `if dest.exists(): return dest` — no freshness check, by design (`cleanup_raw_dump` never touches it). So the vintage has to be derived from the newest `<timestamp>` in the 6.5GB decompressed file, and no tree snapshot, `changelog.json` entry, or `source_eras.json` field carries it. **The currently cached dump is the 2026-07-01 run** (newest revision 2026-07-02, since runs cut at run time rather than midnight; `<generator>MediaWiki 1.46.0-wmf.26</generator>`) — established in `notes/pre-2012/pre-2012-corpus-history.md`'s "Files" section, which is also where the category-free stats path used to validate this method byte-for-byte against `changelog.json` lives. Two consequences: `materialize_snapshots.py`'s deviation #1 (pages deleted before the dump was taken are absent) makes every materialized month a **lower bound** as of that date, and the ~0.5-0.6% validation figure above was measured against that specific vintage. Refreshing the cached dump therefore invalidates all 91 materialized months (the six ranges above, as currently detected) — deliberately re-download it only if the deleted-page drift matters more than reproducibility, then delete both `dump/_backfill_snapshots/tree-<date>.json.gz` *and* `dump/_backfill_content_cache/content-<date>.json.gz` for every materialized month, re-run scoped `pipeline.backfill --months` walks, `make regen-changelog`, and re-note the new vintage here. This is the one genuinely expensive kind of rebuild (~3-5 min per month plus re-materialization): a new vintage invalidates the *cached inputs*, so route 3 can't be used and each month must go through `process_dump` again. Contrast a tree-assembly fix, which reuses those same caches and re-derives the full history in ~3 minutes — see "Two on-disk layers per month" below.
+   **Dump vintage.** Every materialized month inherits the vintage of whichever meta-history run happens to be cached, and nothing in the code or its outputs records which one that is: `MATERIALIZE_SOURCE_URL` fetches the undated `latest/` alias, the file is saved under that same undated name, and `_ensure_materialize_source` is `if dest.exists(): return dest` — no freshness check, by design (`cleanup_raw_dump` never touches it). So the vintage has to be derived from the newest `<timestamp>` in the 6.5GB decompressed file, and no tree snapshot, `changelog.json` entry, or `source_eras.json` field carries it. **The currently cached dump is the 2026-07-01 run** (newest revision 2026-07-02, since runs cut at run time rather than midnight; `<generator>MediaWiki 1.46.0-wmf.26</generator>`) — established in `notes/pre-2012/pre-2012-corpus-history.md`'s "Files" section, which is also where the category-free stats path used to validate this method byte-for-byte against `changelog.json` lives. Two consequences: `materialize_snapshots.py`'s deviation #1 (pages deleted before the dump was taken are absent) makes every materialized month a **lower bound** as of that date, and the ~0.5-0.6% validation figure above was measured against that specific vintage. Refreshing the cached dump therefore invalidates all 91 materialized months (the six ranges above, as currently detected) — deliberately re-download it only if the deleted-page drift matters more than reproducibility, then delete both `data/dump/_backfill_snapshots/tree-<date>.json.gz` *and* `data/dump/_backfill_content_cache/content-<date>.json.gz` for every materialized month, re-run scoped `pipeline.backfill --months` walks, `make regen-changelog`, and re-note the new vintage here. This is the one genuinely expensive kind of rebuild (~3-5 min per month plus re-materialization): a new vintage invalidates the *cached inputs*, so route 3 can't be used and each month must go through `process_dump` again. Contrast a tree-assembly fix, which reuses those same caches and re-derives the full history in ~3 minutes — see "Two on-disk layers per month" below.
 
 `ensure_month` dispatches purely on the date: `>= LEGACY_CUTOVER` → live fetch into `1_current_format_live/<date>/`; anything older → materialize into `3_materialized/<date>/`. The other two era folders (`2_legacy_format_live/`, `4_legacy_format_archive/`) are **dead** — nothing writes to them any more, though `DEFAULT_*_ROOT` constants and the corresponding `ensure_month` parameters still exist. Once a month's snapshot is written, its raw dump directory is deleted immediately (`cleanup_raw_dump`) — pass `--keep-raw-dumps` to disable this.
 
@@ -186,19 +228,19 @@ Building this history uses **two** source kinds, both handled by `pipeline/backf
 
 `docs/data/source_eras.json` (read by `about.html`'s Snapshots section, to describe era 1/era 2's current live-rolling-window start dates) is refreshed by a separate module, `pipeline/update_source_eras.py`, not by `pipeline.backfill` itself — it does two live network lookups (~1 minute total) that have nothing to do with any particular month-pair, so folding it into every `pipeline.backfill` invocation would mean paying that cost on every one of `run_backfill_sequence.sh`'s 150+ per-step calls for no reason. `run_backfill_sequence.sh` runs it once, standalone, after its whole walk finishes.
 
-`pipeline/fetch_legacy.py`'s `list_available_months()` (merged live-rolling-window + Internet Archive month listing, used by `_ensure_legacy_month`, `default_months()`, `update_source_eras`, and `run_backfill_sequence.sh`'s own upfront `--list` call) is genuinely expensive — 2 listing requests plus one more request *per date* in each listing, dozens total, not just 2. Since `run_backfill_sequence.sh` spawns a fresh `python -m pipeline.backfill` subprocess per step, an in-memory cache wouldn't help; it's cached to disk instead (`dump/_fetch_legacy_months_cache.json`, 24h TTL — see `LIST_AVAILABLE_MONTHS_CACHE`/`LIST_AVAILABLE_MONTHS_CACHE_TTL`), so every caller across an entire `run_backfill_sequence.sh` walk shares one query instead of re-deriving the identical listing on every step. Pass `use_cache=False` (or `fetch_legacy --list --no-cache`) to force a fresh query.
+`pipeline/fetch_legacy.py`'s `list_available_months()` (merged live-rolling-window + Internet Archive month listing, used by `_ensure_legacy_month`, `default_months()`, `update_source_eras`, and `run_backfill_sequence.sh`'s own upfront `--list` call) is genuinely expensive — 2 listing requests plus one more request *per date* in each listing, dozens total, not just 2. Since `run_backfill_sequence.sh` spawns a fresh `python -m pipeline.backfill` subprocess per step, an in-memory cache wouldn't help; it's cached to disk instead (`data/dump/_fetch_legacy_months_cache.json`, 24h TTL — see `LIST_AVAILABLE_MONTHS_CACHE`/`LIST_AVAILABLE_MONTHS_CACHE_TTL`), so every caller across an entire `run_backfill_sequence.sh` walk shares one query instead of re-deriving the identical listing on every step. Pass `use_cache=False` (or `fetch_legacy --list --no-cache`) to force a fresh query.
 
 ### Two on-disk layers per month, and what deleting each one triggers
 
-For each backfilled month, `ensure_snapshot` writes two separate gitignored, gzipped files under `dump/`, plus one shared, git-tracked output:
+For each backfilled month, `ensure_snapshot` writes two separate gitignored, gzipped files under `data/dump/`, plus one shared, git-tracked output:
 
-- **`dump/_backfill_content_cache/content-<date>.json.gz`** (the *input* layer) — the small, cheap-to-derive-but-annoying-to-lose inputs `build_tree_json` needs: per-page byte counts (raw/content/transliterated — the output of `compute_all_content_sizes`, the genuinely slow step: `mwparserfromhell` parsing, template expansion, `skrutable` transliteration), category tags, redirect targets, timestamps, and transclusion results. See `pipeline/content_cache.py`.
-- **`dump/_backfill_snapshots/tree-<date>.json.gz`** (the *output* layer) — the fully assembled `tree.json`-shaped snapshot, same schema as `docs/data/tree.json`. What `pipeline/compare.py` actually diffs pairwise.
+- **`data/dump/_backfill_content_cache/content-<date>.json.gz`** (the *input* layer) — the small, cheap-to-derive-but-annoying-to-lose inputs `build_tree_json` needs: per-page byte counts (raw/content/transliterated — the output of `compute_all_content_sizes`, the genuinely slow step: `mwparserfromhell` parsing, template expansion, `skrutable` transliteration), category tags, redirect targets, timestamps, and transclusion results. See `pipeline/content_cache.py`.
+- **`data/dump/_backfill_snapshots/tree-<date>.json.gz`** (the *output* layer) — the fully assembled `tree.json`-shaped snapshot, same schema as `docs/data/tree.json`. What `pipeline/compare.py` actually diffs pairwise.
 - **`docs/data/changelog.json`** (git-tracked, not gitignored) — the append-only pairwise diffs between consecutive snapshots, keyed by `(old_date, date)`. This is the only one of the three that's committed and deployed.
 
 `ensure_snapshot` skips a month entirely (both the cache and the tree snapshot) if `tree-<date>.json[.gz]` already exists. `docs/data/changelog.json` itself is deleted at the start of every `run_backfill_sequence.sh` run and rebuilt from scratch: `pipeline.backfill`'s `main()` always recomputes and overwrites (not skips) the changelog entry for every consecutive snapshot pair it sees, matched by `(old_date, date)` — cheap, since it's just a diff of two already-cached snapshots, no XML parsing — so every run reflects the current tree-assembly logic (`build_tree_json`/`build_category_graph`), never a stale entry left over from before a rollup/dedup/assembly fix (e.g. the redirect-parenting or subpage-category-divergence fixes, or the orphan-bucket `all_stats` fix). `id`s are stable across a rerun as long as the changelog isn't deleted mid-sequence by hand; deleting it (as `run_backfill_sequence.sh` does up front) does reset `next_id` to 1 and renumber every entry on that walk — harmless for display, since the changelog viewer sorts by `date`, not `id`.
 
-Deleting `dump/_backfill_snapshots/tree-<date>.json.gz` is **cheap**, not a full reprocess. `ensure_snapshot` resolves each month by the cheapest route that works, trying four in order:
+Deleting `data/dump/_backfill_snapshots/tree-<date>.json.gz` is **cheap**, not a full reprocess. `ensure_snapshot` resolves each month by the cheapest route that works, trying four in order:
 
 1. An existing `tree-<date>.json.gz` → reused as-is.
 2. The live `docs/data/tree.json`, when `date_str` matches `docs/VERSION`'s `__content_version__` → copied into a snapshot.
@@ -209,11 +251,11 @@ Route 3 is the one that matters: it makes a **tree-assembly** fix (`build_main_t
 
 Route 3 only applies when the cached *inputs* are still valid. When they aren't — a change to `compute_all_content_sizes`, `parse_dump`, `transclusion.py`, or a refreshed meta-history dump for materialized months — pass `force_reprocess=True` to skip routes 2–3 and go straight to the dump. That path *is* genuinely slow (~3-5 min per month, plus re-download/re-materialization) and is the only situation where scoping tightly with `--months` is worth it.
 
-Deleting `dump/_backfill_content_cache/content-<date>.json.gz` alone (without also deleting the tree snapshot) has no effect on the next run, since `ensure_snapshot` never re-derives a snapshot that already exists — the cache is only read when a snapshot is actually being rebuilt (i.e. also deleted).
+Deleting `data/dump/_backfill_content_cache/content-<date>.json.gz` alone (without also deleting the tree snapshot) has no effect on the next run, since `ensure_snapshot` never re-derives a snapshot that already exists — the cache is only read when a snapshot is actually being rebuilt (i.e. also deleted).
 
 In short: **`make backfill` always redoes the changelog** (deleted and rebuilt every run); **to redo tree snapshots after an assembly-logic change, delete them and rerun** — route 3 rebuilds them from the content cache in seconds each, so doing the whole history costs ~3 minutes and is the normal thing to do. Only a change to the cached *inputs* themselves needs `force_reprocess` and a real re-fetch.
 
-`make regen-changelog` is a narrower, fully offline variant of the same rebuild: it lists whatever dates already have a snapshot under `dump/_backfill_snapshots/` (no network calls — not even `fetch_legacy.list_available_months()`) and passes exactly those as `--months` to `pipeline.backfill`, so every month is an instant snapshot-reuse and the whole run is just re-diffing already-cached snapshots (well under a minute for the full range, as of this writing). Use it instead of `make backfill` whenever the snapshots themselves are already trusted and only `pipeline/compare.py`'s diffing logic (or something in `all_stats`/`build_tree_json`, if those snapshots already reflect the fix) needs to be picked up in the changelog — e.g. how this repo's `असम्बद्धवर्गीकृतम्` orphan-bucket trend-chart dips got fixed. It does not fetch, materialize, or rebuild any snapshot — if a month's snapshot is missing or wrong, it's silently excluded from the diff sequence (or diffed with wrong data) rather than fixed; use `make backfill` (or a scoped `python -m pipeline.backfill --months`) for that.
+`make regen-changelog` is a narrower, fully offline variant of the same rebuild: it lists whatever dates already have a snapshot under `data/dump/_backfill_snapshots/` (no network calls — not even `fetch_legacy.list_available_months()`) and passes exactly those as `--months` to `pipeline.backfill`, so every month is an instant snapshot-reuse and the whole run is just re-diffing already-cached snapshots (well under a minute for the full range, as of this writing). Use it instead of `make backfill` whenever the snapshots themselves are already trusted and only `pipeline/compare.py`'s diffing logic (or something in `all_stats`/`build_tree_json`, if those snapshots already reflect the fix) needs to be picked up in the changelog — e.g. how this repo's `असम्बद्धवर्गीकृतम्` orphan-bucket trend-chart dips got fixed. It does not fetch, materialize, or rebuild any snapshot — if a month's snapshot is missing or wrong, it's silently excluded from the diff sequence (or diffed with wrong data) rather than fixed; use `make backfill` (or a scoped `python -m pipeline.backfill --months`) for that.
 
 **This makes it the wrong tool for a newly processed month.** `make process` writes `docs/data/tree.json` and `content-<date>.json.gz` but no snapshot, so immediately after processing a new month that month has no `tree-<date>.json.gz` — it therefore never appears in `regen-changelog`'s glob-derived `--months` list, and the newest transition is silently missing from the changelog with no error. The snapshot only comes into existence during a real `pipeline.backfill` run, where route 2 copies the live `tree.json` into it. See "The monthly update sequence" above.
 

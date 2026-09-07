@@ -26,7 +26,7 @@ import requests
 WIKI_ID = "sawikisource"
 DATASET = "mediawiki_content_current"
 BASE_URL = "https://dumps.wikimedia.org/other"
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "dump" / "1_current_format_live"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "1_current_format_live"
 
 USER_AGENT = (
     "sanskrit-wikisource-atlas/2.0 "

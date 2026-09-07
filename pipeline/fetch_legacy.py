@@ -65,8 +65,8 @@ LIVE_BASE_URL = "https://dumps.wikimedia.org/sawikisource"
 # forward over time, while the Internet Archive's coverage is permanently
 # fixed at whatever it already has. fetch_snapshot picks between these
 # based on dump.source when out_dir isn't explicitly overridden.
-DEFAULT_LIVE_OUT_DIR = Path(__file__).resolve().parent.parent / "dump" / "2_legacy_format_live"
-DEFAULT_ARCHIVE_OUT_DIR = Path(__file__).resolve().parent.parent / "dump" / "4_legacy_format_archive"
+DEFAULT_LIVE_OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "2_legacy_format_live"
+DEFAULT_ARCHIVE_OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "4_legacy_format_archive"
 
 # list_available_months() is genuinely expensive -- 2 listing requests plus
 # one more find_*_snapshot request PER DATE in each listing (each fetching
@@ -82,7 +82,7 @@ DEFAULT_ARCHIVE_OUT_DIR = Path(__file__).resolve().parent.parent / "dump" / "4_l
 # across the many separate subprocesses a full run_backfill_sequence.sh walk
 # spawns. TTL is short enough that a rerun the next day (a genuinely new
 # month may have appeared) still refreshes for free.
-LIST_AVAILABLE_MONTHS_CACHE = Path(__file__).resolve().parent.parent / "dump" / "_fetch_legacy_months_cache.json"
+LIST_AVAILABLE_MONTHS_CACHE = Path(__file__).resolve().parent.parent / "data" / "dump" / "_fetch_legacy_months_cache.json"
 LIST_AVAILABLE_MONTHS_CACHE_TTL = 24 * 3600  # seconds -- a run_backfill_sequence.sh walk can span this long
 
 USER_AGENT = (

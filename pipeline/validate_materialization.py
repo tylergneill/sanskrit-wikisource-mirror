@@ -33,7 +33,7 @@ from pipeline.backfill import (
 )
 from pipeline.compare import build_report, print_summary
 
-DEFAULT_VALIDATION_DIR = Path(__file__).resolve().parent.parent / "dump" / "_materialize_validation"
+DEFAULT_VALIDATION_DIR = Path(__file__).resolve().parent.parent / "data" / "dump" / "_materialize_validation"
 
 
 def main() -> None:

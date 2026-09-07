@@ -538,6 +538,21 @@ function renderRootOverview(root) {
 // header, no per-node stats block, just a plain indented <ul> -- reads as "parts
 // of this page" (structural, from the page-title graph itself) rather than "a
 // subcategory" (an editorial grouping).
+// Is this server offering the local corpus text? Only `serve_docs.py
+// --fulltext` answers /text/ with this header. On GitHub Pages the probe gets
+// no header and every `txt` link stays unrendered. A runtime question, not a
+// build-time one: the same docs/ is deployed either way.
+let FULLTEXT_MODE = false;
+
+async function detectFulltextMode() {
+  try {
+    const res = await fetch("/text/", { method: "HEAD" });
+    FULLTEXT_MODE = res.headers.get("X-Fulltext-Mode") === "on";
+  } catch {
+    FULLTEXT_MODE = false;   // offline, file://, or no server at all
+  }
+}
+
 function renderPageLi(p, ownPath) {
   const hasSubpages = (p.subpages || []).length > 0;
   // p.id alone is NOT unique per rendered occurrence -- pipeline/process.py's
@@ -556,6 +571,22 @@ function renderPageLi(p, ownPath) {
   const isExpanded = state.expandedSubpages.has(expandKey) || searchDefaultExpanded;
 
   const a = el("a", { href: p.url, target: "_blank", rel: "noreferrer" }, displayTitle(p.title, p.id));
+
+  // The locally extracted text, served by `serve_docs.py --fulltext`. Two
+  // conditions, both required: the build saw the text on disk (`has_text`),
+  // and this server is actually offering it (FULLTEXT_MODE). On the published
+  // site the second is false and this never renders -- the point, since the
+  // text is not ours to republish. Keyed by TITLE: page nodes carry no
+  // pageid, and the server indexes both.
+  const localTxt = (FULLTEXT_MODE && p.has_text)
+    ? el("a", {
+        href: `/text/${encodeURIComponent(p.title)}`,
+        target: "_blank",
+        rel: "noreferrer",
+        class: "localTxtLink",
+        title: "Open the locally extracted plain text (this machine only)",
+      }, "txt")
+    : null;
 
   // p.stats is a full rollup (this page's own size/date plus every descendant
   // subpage's, see process.py's build_page_node/recompute_page_dedup) -- shown
@@ -602,6 +633,7 @@ function renderPageLi(p, ownPath) {
     el("span", { class: "pageRowMain" },
       a,
       meta ? el("span", { class: "small" }, meta) : null,
+      localTxt,
       renderSourceIndexLinks(p.source_indexes),
     ),
     toggle,
@@ -1325,10 +1357,37 @@ async function loadVersion() {
   }
 }
 
+
+// A `?q=` in the URL preloads the search box, so another page can deep-link a
+// specific title into this Atlas -- the parent's federated search sends every
+// result row here, which is the only way a hit over there reaches the item's
+// own collection. `?exact=1` additionally turns on exact mode, matching the
+// whole transliterated title rather than any substring; the parent uses it
+// because it knows the exact title it linked.
+//
+// Read once at startup and NOT written back as the user types: the query is a
+// handoff, not a synced piece of state, and rewriting the URL on every
+// keystroke would bury the page in history entries.
+function applyQueryFromURL() {
+  const params = new URLSearchParams(location.search);
+  const q = (params.get("q") || "").trim();
+  if (!q) return;
+  const input = document.getElementById("searchInput");
+  if (input) input.value = q;
+  state.searchQuery = q.toLowerCase();
+  if (params.get("exact") === "1") {
+    state.searchExact = true;
+    const exactToggle = document.getElementById("searchExactToggle");
+    if (exactToggle) exactToggle.checked = true;
+  }
+}
+
 (async function main() {
   initUI();
   loadVersion();
+  await detectFulltextMode();
   await loadData();
+  applyQueryFromURL();
   renderSidebarTree();
   renderMain();
 })();
